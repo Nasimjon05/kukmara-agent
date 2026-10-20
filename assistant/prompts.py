@@ -27,9 +27,14 @@ _SEARCH_RULES = """VDL Market catalogue search (a Telegram mini app with product
 - When they ask for a meal or food, use "type": "food".
 - Add "max_price" (a whole number in so'm) only if they named a budget, e.g. {"q": "lavash", "type": "food", "max_price": 25000}.
 - Write "q" the way a buyer types into a catalogue search: 1-3 words, the item itself, no filler words.
-- If the request is vague, first ask a clarifying question and set "search" to null.
+  The search matches words in item names, so never use generic words like "taom", "ovqat", "food", "mahsulot".
+- If they ask what is available in general ("what is there to eat for 10000?", "what do you sell?"), use an empty "q"
+  with the right type, e.g. {"q": "", "type": "food", "max_price": 10000}.
+- If it is unclear whether they want a product or food, or what they want at all, first ask a clarifying question
+  and set "search" to null.
 - Never invent products, prices or availability. Found items are sent automatically as cards right after your reply,
-  so keep "reply" a short lead-in in their language and do not name items or prices in it.
+  so keep "reply" a short, neutral lead-in in their language: do not name items or prices and do not promise that
+  something is available (the search may find nothing).
 - Otherwise "search" is null."""
 
 _NO_SEARCH_RULE = '"search" must always be null.'
@@ -73,15 +78,26 @@ def build_user_prompt(items: Iterable[Mapping], language: Optional[str]) -> str:
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 SEARCH_TYPES = ("market", "food")
+# The catalogue matches words in item names; these words match nothing, so they mean "browse everything".
+_GENERIC_QUERIES = {
+    "taom", "taomlar", "ovqat", "ovqatlar", "yegulik", "mahsulot", "mahsulotlar", "narsa", "tovar", "tovarlar",
+    "food", "meal", "product", "products", "еда", "блюдо", "товар", "товары", "овқат", "таом",
+}
 
 
 def _clean_search(raw: object) -> Optional[dict]:
     if not isinstance(raw, dict):
         return None
     q = raw.get("q")
-    if not isinstance(q, str) or not q.strip():
+    if not isinstance(q, str):
         return None
-    search = {"q": q.strip()[:100], "type": raw.get("type") if raw.get("type") in SEARCH_TYPES else "market"}
+    q = q.strip()[:100]
+    if q.lower() in _GENERIC_QUERIES:
+        q = ""
+    type_ = raw.get("type")
+    if not q and type_ not in SEARCH_TYPES:
+        return None  # browsing everything needs a clear product/food choice
+    search = {"q": q, "type": type_ if type_ in SEARCH_TYPES else "market"}
     max_price = raw.get("max_price")
     try:
         max_price = int(float(max_price)) if max_price not in (None, "", False) else None

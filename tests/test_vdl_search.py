@@ -133,6 +133,24 @@ def test_parse_agent_reply():
     assert parse_agent_reply('{"reply": "Hi", "search": {"q": "  "}}') == ("Hi", None)
 
 
+def test_parse_generic_requests_browse_everything():
+    browse = parse_agent_reply('{"reply": "Hi", "search": {"q": "", "type": "food", "max_price": 10000}}')[1]
+    assert browse == {"q": "", "type": "food", "max_price": 10000}
+    assert parse_agent_reply('{"reply": "Hi", "search": {"q": "Taom", "type": "food"}}')[1]["q"] == ""
+    assert parse_agent_reply('{"reply": "Hi", "search": {"q": "taom"}}')[1] is None
+    assert parse_agent_reply('{"reply": "Hi", "search": {"q": "", "type": "toys"}}')[1] is None
+
+
+async def test_search_with_empty_query_is_sent():
+    seen = []
+    search = VdlSearch(
+        "https://vdl.test/search", "k",
+        transport=httpx.MockTransport(lambda r: seen.append(r) or httpx.Response(200, json={"items": []})),
+    )
+    await search.search("", "food", 3, 10000)
+    assert dict(seen[0].url.params) == {"q": "", "type": "food", "limit": "3", "max_price": "10000"}
+
+
 def test_card_caption_escapes_html():
     caption = card_caption(make_item(1, name="<script>TV</script>", seller={"name": "A & B"},
                                      old_price=4000000, discount_percent=12))

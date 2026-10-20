@@ -180,6 +180,12 @@ def card_caption(item: dict) -> str:
         if item.get("old_price") and item.get("discount_percent"):
             price += f" (−{item['discount_percent']}%)"
         lines.append(f"💰 {html.escape(price, quote=False)}")
+    installment = item.get("installment")
+    if isinstance(installment, dict):
+        monthly = format_price(installment.get("monthly"))
+        months = installment.get("months")
+        if monthly and isinstance(months, int) and months > 0:
+            lines.append(f"📆 Bo'lib to'lash: {html.escape(monthly, quote=False)} × {months} oy")
     seller = _seller_name(item)
     if seller:
         lines.append(f"🏪 {html.escape(seller, quote=False)}")

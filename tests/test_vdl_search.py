@@ -138,6 +138,13 @@ def test_card_caption_escapes_html():
                                      old_price=4000000, discount_percent=12))
     assert "&lt;script&gt;" in caption and "A &amp; B" in caption
     assert "3 500 001 so'm (−12%)" in caption
+    assert "Bo'lib to'lash" not in caption
+
+
+def test_card_caption_installment():
+    caption = card_caption(make_item(1, installment={"monthly": 40000, "months": 2}))
+    assert "📆 Bo'lib to'lash: 40 000 so'm × 2 oy" in caption
+    assert "Bo'lib" not in card_caption(make_item(1, installment={"monthly": None, "months": 2}))
 
 
 # ------------------------------------------------------------ assistant flow

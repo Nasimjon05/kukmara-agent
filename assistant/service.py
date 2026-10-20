@@ -2,32 +2,42 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
 import re
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Deque, Dict, Optional, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Union
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import BusinessConnection, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from .claude_cli import ClaudeCLI, ClaudeError, ClaudeLimitError
 from .config import Settings
 from .language import detect_language
-from .prompts import SKIP_TOKEN, build_system_prompt, build_user_prompt
+from .prompts import SKIP_TOKEN, build_system_prompt, build_user_prompt, parse_agent_reply
 from .store import HistoryStore, RuntimeState, SeenMessages, ensure_private_dir
+from .vdl_search import make_vdl_search
 
 log = logging.getLogger("assistant")
 
 TELEGRAM_CHUNK = 4000
 OWNER_ALERT_INTERVAL = 600.0
+SEARCH_LIMIT = 3
+MAX_CARDS = 3
+NOT_FOUND_TEXT = {
+    "uz": "Hozircha topilmadi, boshqa so'z bilan qidirib ko'ring",
+    "ru": "Пока ничего не нашлось, попробуйте поискать другими словами",
+    "en": "Nothing found yet, try searching with other words",
+}
 
 
 class Outcome(str, Enum):
@@ -57,6 +67,12 @@ class Preview:
     incoming: str
     reply: str
     note: Optional[str] = None
+    search: Optional[dict] = None
+    cards: List[dict] = field(default_factory=list)
+
+    @property
+    def has_reply(self) -> bool:
+        return bool(self.reply) and not self.reply.startswith(SKIP_TOKEN)
 
 
 def print_preview(preview: Preview) -> None:
@@ -64,8 +80,15 @@ def print_preview(preview: Preview) -> None:
         "=" * 60,
         f"PREVIEW, not sent | chat {preview.chat_id} ({preview.chat_name}) | lang={preview.language or '?'}",
         f"  them: {preview.incoming}",
-        f"  reply: {preview.reply}",
+        f"  reply: {preview.reply if preview.has_reply else '(no text)'}",
     ]
+    if preview.search:
+        lines.append(f"  search: {json.dumps(preview.search, ensure_ascii=False)}")
+        if preview.cards:
+            for item in preview.cards[:MAX_CARDS]:
+                lines.append(f"  card: {card_summary(item)} | {item.get('link') or '-'}")
+        else:
+            lines.append(f"  card: (nothing found) -> {not_found_text(preview.language)}")
     if preview.note:
         lines.append(f"  note: {preview.note}")
     lines.append("=" * 60)
@@ -132,6 +155,73 @@ def profile_is_filled(profile: str) -> bool:
     return False
 
 
+def format_price(value: Any) -> str:
+    try:
+        return f"{int(float(value)):,} so'm".replace(",", " ")
+    except (TypeError, ValueError):
+        return ""
+
+
+def _seller_name(item: dict) -> str:
+    seller = item.get("seller")
+    return str(seller.get("name") or "") if isinstance(seller, dict) else ""
+
+
+def card_summary(item: dict) -> str:
+    parts = [str(item.get("name") or "?"), format_price(item.get("price")), _seller_name(item)]
+    return " — ".join(part for part in parts if part)
+
+
+def card_caption(item: dict) -> str:
+    """HTML caption; every value that comes from the API is escaped."""
+    lines = [f"<b>{html.escape(str(item.get('name') or ''), quote=False)}</b>"]
+    price = format_price(item.get("price"))
+    if price:
+        if item.get("old_price") and item.get("discount_percent"):
+            price += f" (−{item['discount_percent']}%)"
+        lines.append(f"💰 {html.escape(price, quote=False)}")
+    seller = _seller_name(item)
+    if seller:
+        lines.append(f"🏪 {html.escape(seller, quote=False)}")
+    return "\n".join(lines)
+
+
+def _valid_link(value: Any) -> Optional[str]:
+    if isinstance(value, str) and value.startswith(("https://", "http://", "tg://")) and len(value) <= 2048:
+        return value
+    return None
+
+
+def not_found_text(language: Optional[str]) -> str:
+    return NOT_FOUND_TEXT.get(language or "uz", NOT_FOUND_TEXT["uz"])
+
+
+async def send_cards(bot: Bot, chat_id: int, items: List[dict], business_connection_id: str) -> int:
+    """Send up to MAX_CARDS product/dish cards on behalf of the business account. Returns how many were sent."""
+    sent = 0
+    for item in items[:MAX_CARDS]:
+        caption = card_caption(item)
+        kwargs: Dict[str, Any] = dict(
+            chat_id=chat_id, parse_mode="HTML", business_connection_id=business_connection_id
+        )
+        link = _valid_link(item.get("link"))
+        if link:
+            kb = InlineKeyboardBuilder()
+            kb.button(text="🍔 Ochish" if item.get("type") == "food" else "🛍️ Ochish", url=link)
+            kwargs["reply_markup"] = kb.as_markup()
+        image = _valid_link(item.get("image"))
+        if image:
+            try:
+                await bot.send_photo(photo=image, caption=caption, **kwargs)
+                sent += 1
+                continue
+            except TelegramAPIError as exc:  # e.g. Telegram cannot fetch the image: fall back to text
+                log.warning("Sending card photo failed (%s), sending text instead", exc)
+        await bot.send_message(text=caption, **kwargs)
+        sent += 1
+    return sent
+
+
 def _sender_name(message: Message) -> str:
     if message.from_user is not None:
         return message.from_user.full_name
@@ -150,9 +240,11 @@ class Assistant:
         *,
         clock: Callable[[], float] = time.time,
         preview_sink: Callable[[Preview], None] = print_preview,
+        searcher=None,
     ):
         self.settings = settings
         self.generator = generator
+        self.searcher = searcher
         self.clock = clock
         self.preview_sink = preview_sink
         data_dir = ensure_private_dir(settings.data_dir)
@@ -239,11 +331,16 @@ class Assistant:
             reply_or_outcome = await self._generate(bot, conn_id, chat_id, language)
             if isinstance(reply_or_outcome, Outcome):
                 return reply_or_outcome
-            reply = reply_or_outcome.strip()
-            if not reply or reply == SKIP_TOKEN or reply.startswith(SKIP_TOKEN):
+            reply, search = parse_agent_reply(reply_or_outcome)
+            if self.searcher is None:
+                search = None
+            preview = Preview(conn_id, chat_id, chat_name, language, text, reply, search=search)
+            if not preview.has_reply and not search:
                 return Outcome.SKIPPED
-
-            preview = Preview(conn_id, chat_id, chat_name, language, text, reply)
+            if search:
+                preview.cards = await self.searcher.search(
+                    search["q"], search["type"], SEARCH_LIMIT, search.get("max_price")
+                )
             if not self.settings.auto_send:
                 self._preview(preview)
                 return Outcome.PREVIEWED
@@ -264,7 +361,9 @@ class Assistant:
 
     async def _generate(self, bot: Bot, conn_id: str, chat_id: int, language: Optional[str]):
         system_prompt = build_system_prompt(
-            read_profile(self.settings.profile_path), datetime.fromtimestamp(self.clock()).astimezone()
+            read_profile(self.settings.profile_path),
+            datetime.fromtimestamp(self.clock()).astimezone(),
+            search_enabled=self.searcher is not None,
         )
         user_prompt = build_user_prompt(self.history.get(conn_id, chat_id), language)
         try:
@@ -328,16 +427,30 @@ class Assistant:
             return Outcome.PERMISSION_DENIED
 
         try:
-            for chunk in _chunks(preview.reply):
-                await bot.send_message(
-                    chat_id=preview.chat_id, text=chunk, business_connection_id=preview.connection_id
+            if preview.has_reply:
+                for chunk in _chunks(preview.reply):
+                    await bot.send_message(
+                        chat_id=preview.chat_id, text=chunk, business_connection_id=preview.connection_id
+                    )
+                self.history.add(
+                    preview.connection_id, preview.chat_id, "owner", "You", preview.reply, None, self.clock()
+                )
+            if preview.search:
+                if preview.cards:
+                    count = await send_cards(bot, preview.chat_id, preview.cards, preview.connection_id)
+                    shown = "; ".join(card_summary(item) for item in preview.cards[:count])
+                    sent_text = f"[sent VDL Market cards: {shown}]"
+                else:
+                    sent_text = not_found_text(preview.language)
+                    await bot.send_message(
+                        chat_id=preview.chat_id, text=sent_text, business_connection_id=preview.connection_id
+                    )
+                self.history.add(
+                    preview.connection_id, preview.chat_id, "owner", "You", sent_text, None, self.clock()
                 )
         except TelegramAPIError as exc:
             log.error("Sending reply to chat %s failed: %s", preview.chat_id, exc)
             return Outcome.ERROR
-        self.history.add(
-            preview.connection_id, preview.chat_id, "owner", "You", preview.reply, None, self.clock()
-        )
         log.info("Reply sent to chat %s (%s)", preview.chat_id, preview.chat_name)
         return Outcome.SENT
 
@@ -371,6 +484,8 @@ class Assistant:
             )
         else:
             lines.append("Usage limit: none")
+        search = "on" if self.searcher is not None else "off (VDL_API_KEY not set)"
+        lines.append(f"VDL Market search: {search}")
         lines.append(f"Chats in history: {self.history.chat_count()}")
         return "\n".join(lines)
 
@@ -409,6 +524,8 @@ class Assistant:
             "• Pul, qarz, uchrashuv va rejalarga rozilik bermayman, va'da qilmayman.",
             "• profile.md ni to'ldirish kerak — javoblar shunga qarab yoziladi.",
         ]
+        if self.searcher is not None:
+            lines.append("• Mahsulot yoki taom so'rashsa, VDL Market'dan qidirib, 3 tagacha karta yuboraman.")
         if not self.settings.auto_send:
             lines.append("• Javoblar haqiqatan yuborilishi uchun AUTO_SEND=true qiling.")
         return "\n".join(lines)
@@ -428,4 +545,6 @@ def make_claude_cli(settings: Settings) -> ClaudeCLI:
 
 def build_assistant(settings: Settings, **kwargs) -> Assistant:
     generator = kwargs.pop("generator", None) or make_claude_cli(settings)
+    if "searcher" not in kwargs:
+        kwargs["searcher"] = make_vdl_search(settings)
     return Assistant(settings, generator, **kwargs)

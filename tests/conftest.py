@@ -10,16 +10,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+import httpx
 import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.methods import GetBusinessConnection, SendMessage
+from aiogram.methods import GetBusinessConnection, SendMessage, SendPhoto
 from aiogram.types import BusinessConnection, Chat, Message, Update
 
 from assistant.config import load_settings
 from assistant.handlers import build_router
 from assistant.service import build_assistant
+from assistant.vdl_search import VdlSearch
 
 POSIX = os.name == "posix"
 OWNER_ID = 111
@@ -42,6 +44,7 @@ class RecordingSession(BaseSession):
         super().__init__()
         self.requests: List[Any] = []
         self.connections: Dict[str, BusinessConnection] = {}
+        self.fail_photos = False
         self._ids = itertools.count(5000)
 
     async def make_request(self, bot, method, timeout=None):
@@ -51,6 +54,16 @@ class RecordingSession(BaseSession):
             if connection is None:
                 raise TelegramBadRequest(method=method, message="Bad Request: business connection not found")
             return connection
+        if isinstance(method, SendPhoto):
+            if self.fail_photos:
+                raise TelegramBadRequest(method=method, message="Bad Request: wrong file identifier/HTTP URL specified")
+            return Message(
+                message_id=next(self._ids),
+                date=datetime.now(),
+                chat=Chat(id=int(method.chat_id), type="private"),
+                caption=method.caption,
+                business_connection_id=method.business_connection_id,
+            )
         if isinstance(method, SendMessage):
             return Message(
                 message_id=next(self._ids),
@@ -223,6 +236,22 @@ class Harness:
 
     def sent(self) -> List[SendMessage]:
         return self.session.of(SendMessage)
+
+    def photos(self) -> List[SendPhoto]:
+        return self.session.of(SendPhoto)
+
+    def use_search(self, handler: Callable[[httpx.Request], httpx.Response]) -> List[httpx.Request]:
+        """Enable VDL search against a fake HTTP handler (no network). Returns the list of requests made."""
+        requests: List[httpx.Request] = []
+
+        def recording(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return handler(request)
+
+        self.assistant.searcher = VdlSearch(
+            "https://vdl.test/api/public/agent/search", "test-key", transport=httpx.MockTransport(recording)
+        )
+        return requests
 
 
 @pytest.fixture

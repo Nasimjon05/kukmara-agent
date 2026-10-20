@@ -15,6 +15,22 @@ your **Claude subscription** (a `claude setup-token` token). An Anthropic API ke
 - **Which chats the bot sees is decided by Telegram only** — in *Settings → Telegram Business →
   Chatbots* you choose the chats. There is no allowlist in the code.
 - Runs with long polling: no domain, webhook or open port needed.
+- Optional **VDL Market search** (`VDL_API_KEY`): when someone asks for a product or a dish, the bot sends
+  its reply and then up to 3 cards (photo, name, price, seller, "Ochish" button) from the VDL Market mini app.
+
+## VDL Market search
+
+Claude answers every message with JSON: `{"reply": "...", "search": {"q": "lavash", "type": "food", "max_price": 25000} | null}`.
+
+- Products → `type: "market"`, meals → `type: "food"`; `max_price` only when the customer names a budget.
+- A vague request gets a clarifying question and `search: null`.
+- Claude never invents prices: it writes a short lead-in, and the cards come from the API.
+- The API only returns products on sale and in stock, and available dishes from open kitchens; it has no access
+  to customers, orders or phone numbers. The bot asks for 3 results (the API allows up to 10).
+- Nothing found, or the API fails/times out (8 s) → "Hozircha topilmadi, boshqa so'z bilan qidirib ko'ring"
+  (Russian/English variants for those languages). API errors are logged as `VDL search failed`.
+- In PREVIEW mode the search still runs (read-only) and the cards are shown in the log, nothing is sent.
+- `VDL_API_KEY` is removed from the environment of the `claude` process, like the other secrets.
 
 ## Behaviour
 
@@ -70,7 +86,8 @@ claude -p --safe-mode --settings '{"disableAllHooks":true,"enabledPlugins":{...:
    CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat...
    AUTO_SEND=false
    ```
-   Optional: `CLAUDE_MODEL`, `CLAUDE_EFFORT`, `CLAUDE_TIMEOUT_SECONDS`, `LIMIT_COOLDOWN_MINUTES`,
+   Optional: `VDL_API_KEY` (enables VDL Market search; `VDL_API_URL` defaults to
+   `https://vdl-market.lovable.app/api/public/agent/search`), `CLAUDE_MODEL`, `CLAUDE_EFFORT`, `CLAUDE_TIMEOUT_SECONDS`, `LIMIT_COOLDOWN_MINUTES`,
    `OWNER_TAKEOVER_MINUTES`, `HISTORY_LIMIT`. Not needed: `CLAUDE_BIN`, `DATA_DIR`, `PROFILE_PATH`.
 6. Volume: right-click the canvas (or Cmd/Ctrl+K) → *Volume* → select the service → mount path exactly
    `/app/data` → *Deploy*. Without a volume, history, pause and limit state are lost on every deploy.
@@ -129,9 +146,10 @@ All tests run offline: a fake Telegram session and a fake `claude` executable ar
 | `assistant/config.py` | Settings from `.env` or the environment |
 | `assistant/claude_cli.py` | Isolated `claude -p` runner, error classification |
 | `assistant/language.py` | uz / ru / en language hint |
-| `assistant/prompts.py` | System and user prompts |
+| `assistant/prompts.py` | System and user prompts, JSON reply parsing |
+| `assistant/vdl_search.py` | VDL Market catalogue search (httpx) |
 | `assistant/store.py` | History, duplicates and runtime state in `data/` |
-| `assistant/service.py` | Reply logic |
+| `assistant/service.py` | Reply logic, product cards |
 | `assistant/handlers.py` | aiogram router |
 | `profile.md` | Facts about you and your writing style |
 | `Dockerfile`, `railway.json`, `.dockerignore` | Railway deployment |

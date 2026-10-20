@@ -21,7 +21,7 @@ _UZ_LATIN_WORDS = {
     "salom", "assalomu", "alaykum", "rahmat", "raxmat", "yaxshi", "nima", "qalesan", "qalaysan",
     "qalaysiz", "qayerda", "qayerdasan", "bugun", "ertaga", "kerak", "xop", "bopti", "zor",
     "hozir", "keyin", "men", "sen", "siz", "yoq", "nimaga", "qachon", "uyda", "ketdim",
-    "kelaman", "boraman", "qilaman",
+    "kelaman", "boraman", "qilaman", "bormi", "yoqmi", "kerakmi", "qancha", "qanchadan", "narxi",
 }
 _UZ_LATIN_SUFFIXES = (
     "misan", "misiz", "mizmi", "yapsan", "yapman", "yapti", "yapmiz", "asizmi", "ganman", "dingmi",

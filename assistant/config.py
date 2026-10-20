@@ -34,7 +34,11 @@ SETTING_KEYS = (
     "HISTORY_LIMIT",
     "DATA_DIR",
     "PROFILE_PATH",
+    "VDL_API_KEY",
+    "VDL_API_URL",
 )
+
+DEFAULT_VDL_API_URL = "https://vdl-market.lovable.app/api/public/agent/search"
 
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 _TRUE = {"true", "1", "yes", "on"}
@@ -65,7 +69,13 @@ class Settings:
     history_limit: int
     data_dir: Path
     profile_path: Path
+    vdl_api_key: Optional[str] = field(default=None, repr=False)
+    vdl_api_url: str = DEFAULT_VDL_API_URL
     from_environment: bool = False
+
+    @property
+    def vdl_search_enabled(self) -> bool:
+        return bool(self.vdl_api_key)
 
     @property
     def claude_auth_mode(self) -> str:
@@ -171,6 +181,13 @@ def load_settings(
     if effort not in EFFORT_LEVELS:
         raise fail(f"CLAUDE_EFFORT must be one of {', '.join(EFFORT_LEVELS)}")
 
+    vdl_key = get("VDL_API_KEY") or None
+    if vdl_key and re.search(r"\s", vdl_key):
+        raise fail("VDL_API_KEY must be on a single line without spaces")
+    vdl_url = get("VDL_API_URL") or DEFAULT_VDL_API_URL
+    if not vdl_url.startswith("https://"):
+        raise fail("VDL_API_URL must start with https://")
+
     def path(key: str, default: str) -> Path:
         value = Path(os.path.expanduser(get(key) or default))
         return value if value.is_absolute() else base_dir / value
@@ -192,6 +209,8 @@ def load_settings(
         history_limit=integer("HISTORY_LIMIT", 30, 1),
         data_dir=path("DATA_DIR", "data"),
         profile_path=path("PROFILE_PATH", "profile.md"),
+        vdl_api_key=vdl_key,
+        vdl_api_url=vdl_url,
         from_environment=source is not None,
     )
 

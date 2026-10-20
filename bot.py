@@ -19,9 +19,19 @@ from typing import Dict, List, Optional
 from assistant.claude_cli import ClaudeError
 from assistant.config import PROJECT_DIR, SETTING_KEYS, ConfigError, Settings, env_file_warning, load_settings
 from assistant.language import detect_language
-from assistant.prompts import build_system_prompt, build_user_prompt
-from assistant.service import build_assistant, make_claude_cli, profile_is_filled, read_profile
+from assistant.prompts import build_system_prompt, build_user_prompt, parse_agent_reply
+from assistant.service import (
+    MAX_CARDS,
+    SEARCH_LIMIT,
+    build_assistant,
+    card_summary,
+    make_claude_cli,
+    not_found_text,
+    profile_is_filled,
+    read_profile,
+)
 from assistant.store import ensure_private_dir
+from assistant.vdl_search import make_vdl_search
 
 ENV_FILE = PROJECT_DIR / ".env"
 BAD_API_KEY_SOURCES = {"ANTHROPIC_API_KEY", "apiKeyHelper", "/login managed key"}
@@ -71,15 +81,26 @@ async def check_claude(settings: Settings) -> int:
 
 async def try_reply(settings: Settings, text: str) -> int:
     cli = make_claude_cli(settings)
+    searcher = make_vdl_search(settings)
     language = detect_language(text)
-    system_prompt = build_system_prompt(read_profile(settings.profile_path), datetime.now().astimezone())
+    system_prompt = build_system_prompt(
+        read_profile(settings.profile_path), datetime.now().astimezone(), search_enabled=searcher is not None
+    )
     user_prompt = build_user_prompt([{"role": "other", "name": "Friend", "text": text}], language)
     try:
-        reply = await cli.generate(system_prompt, user_prompt)
+        raw = await cli.generate(system_prompt, user_prompt)
     except ClaudeError as exc:
         print(f"Claude error: {exc}", file=sys.stderr)
         return 1
+    reply, search = parse_agent_reply(raw)
     print(f"language: {language}\nmessage:  {text}\nreply:    {reply}")
+    if search and searcher is not None:
+        print(f"search:   {json.dumps(search, ensure_ascii=False)}")
+        items = await searcher.search(search["q"], search["type"], SEARCH_LIMIT, search.get("max_price"))
+        for item in items[:MAX_CARDS]:
+            print(f"card:     {card_summary(item)} | {item.get('link') or '-'}")
+        if not items:
+            print(f"card:     (nothing found) -> {not_found_text(language)}")
     return 0
 
 
@@ -106,6 +127,7 @@ async def run_bot(settings: Settings) -> int:
             log.info("Mode: PREVIEW — replies are only shown in the logs (set AUTO_SEND=true to send)")
         log.info("Claude auth: %s", settings.claude_auth_mode)
         log.info("Claude binary: %s", settings.claude_bin)
+        log.info("VDL Market search: %s", "on" if settings.vdl_search_enabled else "off (VDL_API_KEY not set)")
         if assistant.state.paused:
             log.warning("The assistant starts PAUSED (send /resume to the bot)")
         if not profile_is_filled(read_profile(settings.profile_path)):
